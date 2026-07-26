@@ -1749,7 +1749,7 @@ async function routeKcetQuery(intent, entities){
    ══════════════════════════════════════════════════════════ */
 
 // TODO: replace with your deployed Worker URL (see kea-proxy/README.md)
-const KEA_PROXY_URL = 'https://kea-proxy.YOUR-SUBDOMAIN.workers.dev';
+const KEA_PROXY_URL = 'https://weathered-glade-cda0.nikhilbankapur9920.workers.dev';
 
 const KEA_SESSION_ID = 'keawebentry456';
 const KEA_YEAR = '2026';
@@ -1768,8 +1768,15 @@ function viaProxy(keaUrl){
 async function proxyFetchBuffer(keaUrl){
   try{
     const res = await fetch(viaProxy(keaUrl));
-    if(res.ok) return await res.arrayBuffer();
-  }catch(e){ /* network / proxy-down / not-found — caller tries next candidate */ }
+    if(res.ok){
+      console.info(`[kea-2.0] OK ${res.status} ${keaUrl}`);
+      return await res.arrayBuffer();
+    }
+    const bodyText = await res.text().catch(()=> '');
+    console.warn(`[kea-2.0] ${res.status} ${keaUrl}${bodyText ? ' — ' + bodyText.slice(0,200) : ''}`);
+  }catch(e){
+    console.error(`[kea-2.0] fetch threw for ${keaUrl}:`, e.message);
+  }
   return null;
 }
 
@@ -1921,6 +1928,7 @@ function buildCutoffDatasetFromRawText(rawText){
 let mockPipeline = { status:'idle', mockDate:null, dateConfirmedLive:false, sourceUrl:null, eng:null, enghk:null, error:null };
 
 async function findMockNoticeDateLive(){
+  console.info('[kea-2.0] probing for the mock notice...');
   // fast path: the known-confirmed date for this cycle first
   const anchors = [new Date(KNOWN_MOCK_DATE_2026)];
   // then a ±10 day window around it, in case the cycle date has moved
@@ -1938,46 +1946,65 @@ async function findMockNoticeDateLive(){
         const text = await extractPdfRawText(buf);
         if(text && text.trim().length > 40){
           const parsed = parseSeatResultNoteText(text);
-          if(parsed.mock) return { ...parsed, sourceUrl: url, confirmed: true };
+          if(parsed.mock){ console.info('[kea-2.0] notice parsed OK:', parsed); return { ...parsed, sourceUrl: url, confirmed: true }; }
+          console.warn('[kea-2.0] notice text extracted but no date pattern matched — regex may need adjusting for this notice\'s wording.');
+        } else {
+          console.warn(`[kea-2.0] ${url} downloaded but text layer is empty/too short (${text ? text.trim().length : 0} chars) — likely an image-only Canva export, needs OCR which isn't available client-side.`);
         }
-        // text layer too short — likely a Canva image export with no text
-        // (confirmed real case); OCR isn't available client-side, so we
-        // can't extract dates from this particular file. Keep trying other
-        // candidates in case a text-layer version exists.
-      }catch(e){ /* extraction failed — try next candidate */ }
+      }catch(e){ console.error('[kea-2.0] pdf.js extraction failed for', url, ':', e.message); }
     }
   }
+  console.warn('[kea-2.0] notice probing exhausted all candidates with no usable result.');
   return null;
 }
 
 async function ensureMockDatasetLoaded(){
   if(mockPipeline.status === 'ready') return mockPipeline;
   mockPipeline.status = 'loading';
+  mockPipeline.error = null;
 
   let dateInfo = null;
-  try{ dateInfo = await findMockNoticeDateLive(); }catch(e){ /* fall through to anchor */ }
+  try{ dateInfo = await findMockNoticeDateLive(); }
+  catch(e){ console.error('[kea-2.0] findMockNoticeDateLive threw:', e.message); }
 
   if(!dateInfo){
-    // live probing failed — almost certainly CORS via a misconfigured/undeployed
-    // proxy, or the notice has no text layer. Fall back to the confirmed date.
     dateInfo = { mock: KNOWN_MOCK_DATE_2026, confirmed: false, sourceUrl: null };
+    console.info(`[kea-2.0] falling back to known anchor date ${KNOWN_MOCK_DATE_2026}`);
   }
   mockPipeline.mockDate = dateInfo.mock;
   mockPipeline.dateConfirmedLive = !!dateInfo.confirmed;
   mockPipeline.sourceUrl = dateInfo.sourceUrl;
 
+  console.info(`[kea-2.0] fetching cutoff lists for ${mockPipeline.mockDate}...`);
+  const engUrl = buildCutoffListUrl('eng', mockPipeline.mockDate);
+  const enghkUrl = buildCutoffListUrl('enghk', mockPipeline.mockDate);
   try{
     const [engBuf, enghkBuf] = await Promise.all([
-      proxyFetchBuffer(buildCutoffListUrl('eng', mockPipeline.mockDate)),
-      proxyFetchBuffer(buildCutoffListUrl('enghk', mockPipeline.mockDate))
+      proxyFetchBuffer(engUrl),
+      proxyFetchBuffer(enghkUrl)
     ]);
-    if(engBuf) mockPipeline.eng = buildCutoffDatasetFromRawText(await extractPdfRawText(engBuf));
-    if(enghkBuf) mockPipeline.enghk = buildCutoffDatasetFromRawText(await extractPdfRawText(enghkBuf));
+    if(engBuf){
+      const text = await extractPdfRawText(engBuf);
+      console.info(`[kea-2.0] eng cutoff text: ${text.trim().length} chars`);
+      mockPipeline.eng = buildCutoffDatasetFromRawText(text);
+      console.info(`[kea-2.0] eng parsed: ${mockPipeline.eng.length} colleges`);
+    }
+    if(enghkBuf){
+      const text = await extractPdfRawText(enghkBuf);
+      console.info(`[kea-2.0] enghk cutoff text: ${text.trim().length} chars`);
+      mockPipeline.enghk = buildCutoffDatasetFromRawText(text);
+      console.info(`[kea-2.0] enghk parsed: ${mockPipeline.enghk.length} colleges`);
+    }
+    if(!engBuf && !enghkBuf){
+      mockPipeline.error = `Neither cutoff list could be fetched through the proxy (tried ${engUrl} and ${enghkUrl}) — check the browser console for the specific status/error on each.`;
+    }
   }catch(e){
+    console.error('[kea-2.0] cutoff-list stage threw:', e.message);
     mockPipeline.error = e.message;
   }
 
   mockPipeline.status = (mockPipeline.eng || mockPipeline.enghk) ? 'ready' : 'failed';
+  console.info(`[kea-2.0] pipeline status: ${mockPipeline.status}`);
   return mockPipeline;
 }
 
