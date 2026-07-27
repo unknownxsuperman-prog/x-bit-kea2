@@ -1748,65 +1748,39 @@ async function routeKcetQuery(intent, entities){
 }
 
 /* ══════════════════════════════════════════════════════════
-   X-BIT 2.0 — LIVE KEA PIPELINE
+   X-BIT 2.0 — LIVE KEA PIPELINE (link-scrape based, no URL prediction)
    Fetches through kea-proxy (a Cloudflare Worker) since KEA's server
    doesn't send permissive CORS headers — see kea-proxy/README.md.
-   Session-cached only (module-level vars), re-fetched on page reload.
+   Instead of predicting filenames/dates, this fetches KEA's actual links
+   page and reads the real hrefs KEA already publishes there, matched by
+   round header text and course link text ("Engineering" / "Engineering
+   (HK)"). Confirmed real structure: Bootstrap collapse .card elements,
+   header = round name, body = <a href="...pdf">CourseLabel</a> links.
    ══════════════════════════════════════════════════════════ */
 
-// TODO: replace with your deployed Worker URL (see kea-proxy/README.md)
+// TODO: replace with your deployed Worker URL if this ever changes
 const KEA_PROXY_URL = 'https://weathered-glade-cda0.nikhilbankapur9920.workers.dev';
-
-const KEA_SESSION_ID = 'keawebentry456';
 const KEA_YEAR = '2026';
-// Confirmed real mock-round date for the current cycle (from the actual
-// SEAT_RESULT_NOTE notice) — used as a fast-path / fallback anchor, since
-// live notice probing can fail (CORS via proxy misconfig, notice not up
-// yet, or the notice PDF having no text layer at all — we've confirmed
-// KEA's schedule notices can be pure Canva image exports needing OCR,
-// which isn't available client-side).
-const KNOWN_MOCK_DATE_2026 = '2026-07-06';
+const KEA_LINKS_PAGE = 'https://cetonline.karnataka.gov.in/kea/ugcet2026';
 
 function viaProxy(keaUrl){
   return `${KEA_PROXY_URL}/?url=${encodeURIComponent(keaUrl)}`;
 }
-
+async function proxyFetchText(keaUrl){
+  try{
+    const res = await fetch(viaProxy(keaUrl));
+    if(res.ok){ console.info(`[kea-2.0] OK ${res.status} ${keaUrl}`); return await res.text(); }
+    console.warn(`[kea-2.0] ${res.status} ${keaUrl}`);
+  }catch(e){ console.error(`[kea-2.0] fetch threw for ${keaUrl}:`, e.message); }
+  return null;
+}
 async function proxyFetchBuffer(keaUrl){
   try{
     const res = await fetch(viaProxy(keaUrl));
-    if(res.ok){
-      console.info(`[kea-2.0] OK ${res.status} ${keaUrl}`);
-      return await res.arrayBuffer();
-    }
-    const bodyText = await res.text().catch(()=> '');
-    console.warn(`[kea-2.0] ${res.status} ${keaUrl}${bodyText ? ' — ' + bodyText.slice(0,200) : ''}`);
-  }catch(e){
-    console.error(`[kea-2.0] fetch threw for ${keaUrl}:`, e.message);
-  }
+    if(res.ok){ console.info(`[kea-2.0] OK ${res.status} ${keaUrl}`); return await res.arrayBuffer(); }
+    console.warn(`[kea-2.0] ${res.status} ${keaUrl}`);
+  }catch(e){ console.error(`[kea-2.0] fetch threw for ${keaUrl}:`, e.message); }
   return null;
-}
-
-function ddmmyyyy(date){
-  const dd = String(date.getDate()).padStart(2,'0');
-  const mm = String(date.getMonth()+1).padStart(2,'0');
-  return `${dd}${mm}${date.getFullYear()}`;
-}
-function isoToDdmmyyyy(iso){
-  const [y,m,d] = iso.split('-');
-  return `${d}${m}${y}`;
-}
-
-function buildNoticeCandidateUrls(date){
-  const dateStr = ddmmyyyy(date);
-  // casing is inconsistent across KEA doc types (confirmed: UGCET_CHOICE_NOTE
-  // is uppercase, ugcet_SEAT_RESULT_NOTE is lowercase) — probe both
-  return ['UGCET','ugcet'].map(prefix =>
-    `https://cetonline.karnataka.gov.in/${KEA_SESSION_ID}/ugcet${KEA_YEAR}/${prefix}_SEAT_RESULT_NOTE_ENG_${dateStr}english.pdf`
-  );
-}
-function buildCutoffListUrl(stream, isoDate){
-  const streamCode = stream === 'enghk' ? 'H' : 'R'; // confirmed real pattern
-  return `https://cetonline.karnataka.gov.in/${KEA_SESSION_ID}/ugcet${KEA_YEAR}/PROF_CODE_E_${streamCode}_${isoToDdmmyyyy(isoDate)}english.pdf`;
 }
 
 /** Extract raw text from every page of a PDF, reconstructing line breaks from
@@ -1829,25 +1803,6 @@ async function extractPdfRawText(arrayBuffer){
     text += '\n';
   }
   return text;
-}
-
-/** Ported from our Node-side parse-seat-result-note.js — pure regex, no Node deps. */
-function parseSeatResultNoteText(rawText){
-  const text = rawText.replace(/\r/g,'').replace(/[ \t]+/g,' ').replace(/\u2013|\u2014/g,'-').trim();
-  const DATE_RE = /(\d{2})\s*[-\/.]\s*(\d{2})\s*[-\/.]\s*(\d{4})/;
-  function extractDateAfter(phrase, windowChars=100){
-    const idx = text.toLowerCase().indexOf(phrase.toLowerCase());
-    if(idx===-1) return null;
-    const window = text.slice(idx, idx+phrase.length+windowChars);
-    const m = window.match(DATE_RE);
-    return m ? `${m[3]}-${m[2]}-${m[1]}` : null;
-  }
-  return {
-    mock: extractDateAfter('published on the KEA Website on') || extractDateAfter('Date:') || extractDateAfter('Date'),
-    optionModifyDeadline: extractDateAfter('last date fixed for entering the options'),
-    provisional: extractDateAfter('provisional result of the first round'),
-    round1: extractDateAfter('final result of the first round')
-  };
 }
 
 /* ── ported from the KCET Cutoff Parser tool (xos1 state machine) ── */
@@ -1930,121 +1885,107 @@ function buildCutoffDatasetFromRawText(rawText){
   return Array.from(collegeMap.values());
 }
 
-/* ── orchestration + session cache (one entry per round) ── */
+/* ── round detection + link scraping ── */
 const ROUND_LABELS = { mock: 'Mock Round', provisional: 'Provisional Round', round1: 'First Round (Final)' };
-let roundPipelines = {
-  mock: { status:'idle', date:null, dateConfirmedLive:false, sourceUrl:null, eng:null, enghk:null, error:null },
-  provisional: { status:'idle', date:null, dateConfirmedLive:false, sourceUrl:null, eng:null, enghk:null, error:null },
-  round1: { status:'idle', date:null, dateConfirmedLive:false, sourceUrl:null, eng:null, enghk:null, error:null }
+const ROUND_HEADER_PATTERNS = {
+  mock: /\bmock\b.*(cutoff|allotment)/i,
+  provisional: /\bprovisional\b.*(cutoff|allotment)/i,
+  round1: /\b(1st|first)\s*round\b.*(cutoff|allotment)/i
 };
 
-/* ── persistent event-date cache — once mock/provisional/round1 are all
-   known, skip searching for the notice entirely on future calls ── */
-const KEA_DATES_LS_KEY = `kea_dates_${KEA_YEAR}`;
+/** Finds the .card whose header matches this round, then within it finds the
+ *  anchor for plain "Engineering" and for "Engineering (HK)" by their exact
+ *  visible link text — reads KEA's real href directly, no guessing. */
+function findRoundCardLinks(doc, round){
+  const cards = Array.from(doc.querySelectorAll('.card'));
+  const pattern = ROUND_HEADER_PATTERNS[round];
+  for(const card of cards){
+    const headerEl = card.querySelector('.card-header');
+    if(!headerEl) continue;
+    const headerText = headerEl.textContent.replace(/\s+/g,' ').trim();
+    if(!pattern.test(headerText)) continue;
 
-function loadCachedKeaDates(){ return LS.get(KEA_DATES_LS_KEY, null); }
-function saveCachedKeaDates(dates){ LS.set(KEA_DATES_LS_KEY, { ...dates, cachedAt: new Date().toISOString() }); }
-function hasAllRoundDates(d){ return !!(d && d.mock && d.provisional && d.round1); }
-
-/** Flexible forward-only search: start at `startDateIso`, and if nothing's
- *  found there, walk forward one day at a time (not a scattered window) —
- *  matches how KEA actually moves dates during a cycle (later, not earlier). */
-async function findMockNoticeDateLive(startDateIso, maxDaysForward = 21){
-  console.info(`[kea-2.0] probing for the KEA schedule notice starting ${startDateIso}...`);
-  for(let offset = 0; offset <= maxDaysForward; offset++){
-    const d = new Date(startDateIso);
-    d.setDate(d.getDate() + offset);
-    for(const url of buildNoticeCandidateUrls(d)){
-      const buf = await proxyFetchBuffer(url);
-      if(!buf) continue;
-      try{
-        const text = await extractPdfRawText(buf);
-        if(text && text.trim().length > 40){
-          const parsed = parseSeatResultNoteText(text);
-          if(parsed.mock){ console.info('[kea-2.0] notice parsed OK:', parsed); return { ...parsed, sourceUrl: url, confirmed: true }; }
-          console.warn('[kea-2.0] notice text extracted but no date pattern matched — regex may need adjusting for this notice\'s wording.');
-        } else {
-          console.warn(`[kea-2.0] ${url} downloaded but text layer is empty/too short (${text ? text.trim().length : 0} chars) — likely an image-only Canva export, needs OCR which isn't available client-side.`);
-        }
-      }catch(e){ console.error('[kea-2.0] pdf.js extraction failed for', url, ':', e.message); }
+    const anchors = Array.from(card.querySelectorAll('a[href]'));
+    let engUrl = null, engHkUrl = null;
+    for(const a of anchors){
+      const text = a.textContent.replace(/\s+/g,' ').trim();
+      if(/^engineering\s*\(\s*hk\s*\)$/i.test(text)) engHkUrl = a.getAttribute('href');
+      else if(!engUrl && /^engineering(\s*\(\s*spl\s*\))?$/i.test(text)) engUrl = a.getAttribute('href');
     }
+    console.info(`[kea-2.0] matched card "${headerText}" — eng:${engUrl} enghk:${engHkUrl}`);
+    return { headerText, engUrl, engHkUrl };
   }
-  console.warn(`[kea-2.0] notice probing exhausted ${maxDaysForward} days forward with no usable result.`);
+  console.warn(`[kea-2.0] no card matched round "${round}" (looking for pattern: ${pattern})`);
   return null;
 }
 
-/** Fast path: if mock/provisional/round1 are already cached, return them
- *  immediately with zero network calls. Only searches when incomplete. */
-async function ensureKeaDatesLoaded(){
-  const cached = loadCachedKeaDates();
-  if(hasAllRoundDates(cached)){
-    console.info('[kea-2.0] all three round dates already cached — skipping search entirely:', cached);
-    return cached;
-  }
+/* ── persistent link cache — once we've scraped a round's real hrefs once,
+   skip re-scraping the links page on future calls for that round ── */
+const KEA_LINKS_LS_KEY = `kea_links_${KEA_YEAR}`;
+function loadCachedLinks(){ return LS.get(KEA_LINKS_LS_KEY, {}); }
+function saveCachedLinks(all){ LS.set(KEA_LINKS_LS_KEY, all); }
 
-  const startDateIso = (cached && cached.mock) ? cached.mock : KNOWN_MOCK_DATE_2026;
-  let found = null;
-  try{ found = await findMockNoticeDateLive(startDateIso); }
-  catch(e){ console.error('[kea-2.0] findMockNoticeDateLive threw:', e.message); }
+/* ── orchestration + session cache (one entry per round) ── */
+let roundPipelines = {
+  mock: { status:'idle', eng:null, enghk:null, error:null },
+  provisional: { status:'idle', eng:null, enghk:null, error:null },
+  round1: { status:'idle', eng:null, enghk:null, error:null }
+};
 
-  if(found){
-    saveCachedKeaDates(found);
-    return found;
-  }
-
-  const fallback = cached || { mock: KNOWN_MOCK_DATE_2026, confirmed: false };
-  console.info('[kea-2.0] live search unavailable — using fallback dates:', fallback);
-  return fallback;
-}
-
-/** round is 'mock' | 'provisional' | 'round1'. NOTE: the PROF_CODE_E_R/H
- *  doc-type prefix is only CONFIRMED for the mock round (from the real URL
- *  you found) — we're assuming provisional/round1 reuse the same prefix
- *  with their own date, since KEA typically keeps doc-type naming stable
- *  across rounds within a cycle. Flag it if a round-specific fetch 404s
- *  consistently — that'd mean this assumption is wrong for that round. */
 async function ensureRoundDatasetLoaded(round){
   const pipeline = roundPipelines[round];
   if(pipeline.status === 'ready') return pipeline;
   pipeline.status = 'loading';
   pipeline.error = null;
 
-  const dateInfo = await ensureKeaDatesLoaded();
-  const roundDate = dateInfo[round];
-  if(!roundDate){
-    pipeline.status = 'failed';
-    pipeline.error = `The ${ROUND_LABELS[round]} date isn't known yet (KEA likely hasn't announced it) — only ${Object.keys(dateInfo).filter(k=>['mock','provisional','round1'].includes(k) && dateInfo[k]).join(', ') || 'none'} of the three dates are currently known.`;
-    return pipeline;
-  }
-  pipeline.date = roundDate;
-  pipeline.dateConfirmedLive = round === 'mock' ? !!dateInfo.confirmed : hasAllRoundDates(dateInfo);
-  pipeline.sourceUrl = dateInfo.sourceUrl || null;
+  const cachedAll = loadCachedLinks();
+  let links = cachedAll[round];
 
-  console.info(`[kea-2.0] fetching ${round} cutoff lists for ${pipeline.date}...`);
-  const engUrl = buildCutoffListUrl('eng', pipeline.date);
-  const enghkUrl = buildCutoffListUrl('enghk', pipeline.date);
+  if(!links || (!links.engUrl && !links.engHkUrl)){
+    console.info(`[kea-2.0] no cached links for ${round} — scraping ${KEA_LINKS_PAGE}...`);
+    const html = await proxyFetchText(KEA_LINKS_PAGE);
+    if(!html){
+      pipeline.status = 'failed';
+      pipeline.error = `Couldn't fetch the KEA links page through the proxy. Check KEA_PROXY_URL is deployed/reachable.`;
+      return pipeline;
+    }
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    links = findRoundCardLinks(doc, round);
+    if(!links || (!links.engUrl && !links.engHkUrl)){
+      pipeline.status = 'failed';
+      pipeline.error = `Found the KEA links page, but couldn't find a "${ROUND_LABELS[round]}" section with Engineering links on it. KEA may not have published this round yet, or the page wording changed.`;
+      return pipeline;
+    }
+    cachedAll[round] = links;
+    saveCachedLinks(cachedAll);
+  } else {
+    console.info(`[kea-2.0] using cached links for ${round}:`, links);
+  }
+
   try{
-    const [engBuf, enghkBuf] = await Promise.all([
-      proxyFetchBuffer(engUrl),
-      proxyFetchBuffer(enghkUrl)
-    ]);
-    if(engBuf){
-      const text = await extractPdfRawText(engBuf);
-      console.info(`[kea-2.0] ${round} eng cutoff text: ${text.trim().length} chars`);
-      pipeline.eng = buildCutoffDatasetFromRawText(text);
-      console.info(`[kea-2.0] ${round} eng parsed: ${pipeline.eng.length} colleges`);
+    if(links.engUrl){
+      const buf = await proxyFetchBuffer(links.engUrl);
+      if(buf){
+        const text = await extractPdfRawText(buf);
+        console.info(`[kea-2.0] ${round} eng cutoff text: ${text.trim().length} chars`);
+        pipeline.eng = buildCutoffDatasetFromRawText(text);
+        console.info(`[kea-2.0] ${round} eng parsed: ${pipeline.eng.length} colleges`);
+      }
     }
-    if(enghkBuf){
-      const text = await extractPdfRawText(enghkBuf);
-      console.info(`[kea-2.0] ${round} enghk cutoff text: ${text.trim().length} chars`);
-      pipeline.enghk = buildCutoffDatasetFromRawText(text);
-      console.info(`[kea-2.0] ${round} enghk parsed: ${pipeline.enghk.length} colleges`);
+    if(links.engHkUrl){
+      const buf = await proxyFetchBuffer(links.engHkUrl);
+      if(buf){
+        const text = await extractPdfRawText(buf);
+        console.info(`[kea-2.0] ${round} enghk cutoff text: ${text.trim().length} chars`);
+        pipeline.enghk = buildCutoffDatasetFromRawText(text);
+        console.info(`[kea-2.0] ${round} enghk parsed: ${pipeline.enghk.length} colleges`);
+      }
     }
-    if(!engBuf && !enghkBuf){
-      pipeline.error = `Neither cutoff list could be fetched through the proxy (tried ${engUrl} and ${enghkUrl}) — check the browser console for the specific status/error on each.`;
+    if(!pipeline.eng && !pipeline.enghk){
+      pipeline.error = `Found the real links but couldn't fetch/parse either PDF — check the browser console for per-file status.`;
     }
   }catch(e){
-    console.error(`[kea-2.0] ${round} cutoff-list stage threw:`, e.message);
+    console.error(`[kea-2.0] ${round} cutoff fetch/parse threw:`, e.message);
     pipeline.error = e.message;
   }
 
@@ -2056,18 +1997,15 @@ async function ensureRoundDatasetLoaded(round){
 /* ── chat flow ── */
 async function startRoundCutoffFlow(round){
   const label = ROUND_LABELS[round];
-  protonSays(loadingLine(`Finding the ${label.toLowerCase()} notice and cutoff lists…`));
+  protonSays(loadingLine(`Finding the ${label.toLowerCase()} links and cutoff lists…`));
   const pipeline = await ensureRoundDatasetLoaded(round);
 
   if(pipeline.status !== 'ready'){
-    protonSays(`<i class="fa-solid fa-triangle-exclamation"></i> Couldn't load live ${label.toLowerCase()} cutoff data. ${pipeline.error ? escapeHtml(pipeline.error) : `This almost always means the CORS proxy (kea-proxy) isn't deployed/reachable, or KEA's server is unreachable right now.`} Check <code>KEA_PROXY_URL</code> is set to your deployed Worker.`);
+    protonSays(`<i class="fa-solid fa-triangle-exclamation"></i> Couldn't load live ${label.toLowerCase()} cutoff data. ${pipeline.error ? escapeHtml(pipeline.error) : 'Check KEA_PROXY_URL is set to your deployed Worker.'}`);
     return;
   }
 
-  const dateNote = pipeline.dateConfirmedLive
-    ? `confirmed live from the KEA notice (${pipeline.date})`
-    : `using the last known ${label.toLowerCase()} date (${pipeline.date}) — live notice lookup didn't resolve, so this is the last confirmed date rather than a fresh fetch`;
-  protonSays(`Got the ${label.toLowerCase()} data — ${dateNote}. Pick your dataset, college, and category below.`);
+  protonSays(`Got the ${label.toLowerCase()} cutoff data straight from KEA's links page. Pick your dataset, college, and category below.`);
   renderRoundCutoffCard(round);
 }
 
@@ -2179,6 +2117,7 @@ function wireRoundCutoffCard(card, round){
     protonSays(html, `${rows.length} branch cutoffs`);
   });
 }
+
 
 /* ══════════════════════════════════════════════════════════
    COMPOSER
